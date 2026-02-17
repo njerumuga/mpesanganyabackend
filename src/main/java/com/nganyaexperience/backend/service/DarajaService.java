@@ -17,6 +17,7 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class DarajaService {
 
+    // Keep your existing property names (mpesa.*) so Render vars can match
     @Value("${mpesa.env:sandbox}")
     private String env;
 
@@ -38,7 +39,6 @@ public class DarajaService {
     private final RestTemplate restTemplate = new RestTemplate();
 
     private String baseUrl() {
-        // Daraja base URLs
         return ("production".equalsIgnoreCase(env))
                 ? "https://api.safaricom.co.ke"
                 : "https://sandbox.safaricom.co.ke";
@@ -46,7 +46,7 @@ public class DarajaService {
 
     public String getAccessToken() {
         if (consumerKey == null || consumerKey.isBlank() || consumerSecret == null || consumerSecret.isBlank()) {
-            throw new RuntimeException("Missing MPESA_CONSUMER_KEY / MPESA_CONSUMER_SECRET");
+            throw new RuntimeException("Missing mpesa.consumer-key / mpesa.consumer-secret");
         }
 
         String credentials = consumerKey + ":" + consumerSecret;
@@ -54,6 +54,7 @@ public class DarajaService {
 
         HttpHeaders headers = new HttpHeaders();
         headers.set("Authorization", "Basic " + basic);
+
         HttpEntity<Void> entity = new HttpEntity<>(headers);
 
         ResponseEntity<Map> resp = restTemplate.exchange(
@@ -70,25 +71,43 @@ public class DarajaService {
         return String.valueOf(body.get("access_token"));
     }
 
+    /**
+     * UPDATED SIGNATURE (8 args) to match your controller call.
+     *
+     * @param businessShortCode  STK push shortcode (sandbox: 174379; production till: 7821537)
+     * @param partyB             receiving shortcode (same as shortcode for most cases)
+     * @param transactionType    CustomerPayBillOnline (sandbox/paybill) OR CustomerBuyGoodsOnline (till)
+     */
     public Map<String, Object> stkPush(
             String accessToken,
             String phone254,
-            double amount,
-            String eventShortcodeOrNull,
+            int amount,
+            String businessShortCode,
+            String partyB,
+            String transactionType,
             String accountReference,
             String transactionDesc
     ) {
         if (passkey == null || passkey.isBlank()) {
-            throw new RuntimeException("Missing MPESA_PASSKEY");
+            throw new RuntimeException("Missing mpesa.passkey");
         }
         if (callbackUrl == null || callbackUrl.isBlank()) {
-            throw new RuntimeException("Missing MPESA_CALLBACK_URL");
+            throw new RuntimeException("Missing mpesa.callback-url");
         }
 
-        String shortcode = (eventShortcodeOrNull == null || eventShortcodeOrNull.isBlank())
+        String shortcode = (businessShortCode == null || businessShortCode.isBlank())
                 ? defaultShortcode
-                : eventShortcodeOrNull;
+                : businessShortCode;
 
+        String pb = (partyB == null || partyB.isBlank())
+                ? shortcode
+                : partyB;
+
+        String txType = (transactionType == null || transactionType.isBlank())
+                ? "CustomerPayBillOnline"
+                : transactionType;
+
+        // Daraja password: Base64Encode(Shortcode + Passkey + Timestamp)
         String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMddHHmmss"));
         String password = Base64.getEncoder()
                 .encodeToString((shortcode + passkey + timestamp).getBytes(StandardCharsets.UTF_8));
@@ -97,10 +116,10 @@ public class DarajaService {
         payload.put("BusinessShortCode", shortcode);
         payload.put("Password", password);
         payload.put("Timestamp", timestamp);
-        payload.put("TransactionType", "CustomerPayBillOnline");
-        payload.put("Amount", (int) Math.round(amount));
+        payload.put("TransactionType", txType);
+        payload.put("Amount", amount); // already int in controller
         payload.put("PartyA", phone254);
-        payload.put("PartyB", shortcode);
+        payload.put("PartyB", pb);
         payload.put("PhoneNumber", phone254);
         payload.put("CallBackURL", callbackUrl);
         payload.put("AccountReference", accountReference);
@@ -122,7 +141,7 @@ public class DarajaService {
         Map body = resp.getBody();
         if (body == null) throw new RuntimeException("Empty Daraja STK response");
 
-        // return as map
+        // Convert to Map<String,Object>
         Map<String, Object> out = new HashMap<>();
         for (Object k : body.keySet()) {
             out.put(String.valueOf(k), body.get(k));
