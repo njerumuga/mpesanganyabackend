@@ -50,25 +50,22 @@ public class SecurityConfig {
                 .cors(Customizer.withDefaults())
                 .sessionManagement(sm -> sm.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(auth -> auth
-                        // ✅ Always allow preflight
+                        // ✅ Allow preflight requests
                         .requestMatchers(HttpMethod.OPTIONS, "/**").permitAll()
 
-                        // health + auth
+                        // Public endpoints
                         .requestMatchers("/health", "/actuator/**").permitAll()
                         .requestMatchers("/api/auth/**").permitAll()
-
-                        // public read endpoints
                         .requestMatchers(HttpMethod.GET, "/api/events/**").permitAll()
                         .requestMatchers(HttpMethod.GET, "/api/nganyas/**").permitAll()
 
-                        // bookings require auth (JWT)
+                        // Protected endpoints
                         .requestMatchers("/api/bookings/**").authenticated()
 
-                        // admin (keep as you had it)
+                        // Admin (adjust later if needed)
                         .requestMatchers("/api/admin/auth/**").permitAll()
                         .requestMatchers("/api/admin/**").permitAll()
 
-                        // everything else open for now
                         .anyRequest().permitAll()
                 )
                 .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class);
@@ -80,18 +77,17 @@ public class SecurityConfig {
     public CorsConfigurationSource corsConfigurationSource() {
         CorsConfiguration cfg = new CorsConfiguration();
 
-        // ✅ Add the EXACT frontend domain (NO trailing slash)
+        // ✅ Allow your LIVE frontend + local dev
         cfg.setAllowedOrigins(List.of(
-                "https://nganya-fronted21.onrender.com",
+                "https://mpesanganyafronted.onrender.com",
                 "http://localhost:5173",
-                "http://localhost:3000",
-                "https://nganya-frontend.onrender.com",
-                "https://nganya-frontend-v2.onrender.com"
+                "http://localhost:3000"
         ));
 
         cfg.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE", "OPTIONS"));
         cfg.setAllowedHeaders(List.of("*"));
-        cfg.setAllowCredentials(true); // keep true if you use cookies/auth; ok with JWT too
+        cfg.setExposedHeaders(List.of("Authorization"));
+        cfg.setAllowCredentials(false); // JWT in headers, not cookies
         cfg.setMaxAge(3600L);
 
         UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
