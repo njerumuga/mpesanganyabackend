@@ -99,4 +99,34 @@ public class BookingService {
 
         return bookingRepository.save(booking);
     }
+
+    /**
+     * Mark a booking as FAILED (payment cancelled/failed).
+     * You can still retry by starting a new STK push which will move it back to PENDING.
+     */
+    @Transactional
+    public Booking markFailed(Long bookingId) {
+        Booking booking = bookingRepository.findById(bookingId)
+                .orElseThrow(() -> new RuntimeException("Booking not found"));
+
+        if (booking.getPaymentStatus() == Booking.PaymentStatus.PAID) return booking;
+
+        booking.setPaymentStatus(Booking.PaymentStatus.FAILED);
+        return bookingRepository.save(booking);
+    }
+
+    /**
+     * Ensure a booking is in PENDING state so user can retry payment.
+     */
+    @Transactional
+    public Booking ensurePending(Long bookingId) {
+        Booking booking = bookingRepository.findById(bookingId)
+                .orElseThrow(() -> new RuntimeException("Booking not found"));
+
+        if (booking.getPaymentStatus() != Booking.PaymentStatus.PAID) {
+            booking.setPaymentStatus(Booking.PaymentStatus.PENDING);
+            return bookingRepository.save(booking);
+        }
+        return booking;
+    }
 }

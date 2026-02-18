@@ -59,8 +59,11 @@ public class SecurityConfig {
                         .requestMatchers(HttpMethod.GET, "/api/events/**").permitAll()
                         .requestMatchers(HttpMethod.GET, "/api/nganyas/**").permitAll()
 
-                        // Protected endpoints
-                        .requestMatchers("/api/bookings/**").authenticated()
+                        // ✅ Customer booking + Daraja endpoints are PUBLIC (customers don't login)
+                        .requestMatchers(HttpMethod.POST, "/api/bookings/**").permitAll()
+                        .requestMatchers("/api/payments/**").permitAll()
+
+                        // (If you later add customer accounts, you can protect customer endpoints then)
 
                         // Admin (adjust later if needed)
                         .requestMatchers("/api/admin/auth/**").permitAll()

@@ -7,4 +7,5 @@ import java.util.Optional;
 
 public interface MpesaPaymentRepository extends JpaRepository<MpesaPayment, Long> {
     Optional<MpesaPayment> findByCheckoutRequestId(String checkoutRequestId);
+    Optional<MpesaPayment> findByBooking_Id(Long bookingId);
 }

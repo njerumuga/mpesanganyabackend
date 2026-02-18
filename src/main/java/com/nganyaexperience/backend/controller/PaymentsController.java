@@ -2,6 +2,7 @@ package com.nganyaexperience.backend.controller;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nganyaexperience.backend.entity.Booking;
+import com.nganyaexperience.backend.entity.Event;
 import com.nganyaexperience.backend.entity.MpesaPayment;
 import com.nganyaexperience.backend.repository.BookingRepository;
 import com.nganyaexperience.backend.repository.MpesaPaymentRepository;
@@ -9,7 +10,6 @@ import com.nganyaexperience.backend.service.BookingService;
 import com.nganyaexperience.backend.service.DarajaService;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
@@ -26,51 +26,32 @@ public class PaymentsController {
     private final BookingRepository bookingRepository;
     private final MpesaPaymentRepository paymentRepository;
     private final BookingService bookingService;
-
     private final ObjectMapper objectMapper = new ObjectMapper();
-
-    // ===== Daraja config from Render ENV =====
-    // Sandbox: 174379
-    // Production: your Till 7821537
-    @Value("${DARAJA_SHORTCODE:174379}")
-    private String darajaShortcode;
-
-    // Sandbox: CustomerPayBillOnline
-    // Production Till: CustomerBuyGoodsOnline
-    @Value("${DARAJA_TRANSACTION_TYPE:CustomerPayBillOnline}")
-    private String transactionType;
-
-    // Sandbox: 174379
-    // Production Till: 7821537
-    @Value("${DARAJA_PARTYB:174379}")
-    private String partyB;
-
-    @Value("${DARAJA_ENV:sandbox}")
-    private String darajaEnv;
 
     @Data
     public static class StkPushRequest {
         private Long bookingId;
-        private String phoneNumber; // 2547..., 07..., +2547..., 7...
+        private String phoneNumber; // 2547... / 07...
     }
 
     /**
-     * POST /api/payments/stk-push
-     * Creates an STK push prompt on the user's phone.
+     * Trigger STK Push for a booking.
+     * - Works for both PAYBILL (CustomerPayBillOnline) and TILL (CustomerBuyGoodsOnline)
+     * - Does NOT reduce seats here; seats are reduced ONLY after callback success.
      */
     @PostMapping("/stk-push")
     public ResponseEntity<?> stkPush(@RequestBody StkPushRequest req) {
-        if (req.getBookingId() == null) {
-            return ResponseEntity.badRequest().body(Map.of("error", "bookingId required"));
-        }
+        if (req.getBookingId() == null) return ResponseEntity.badRequest().body(Map.of("error", "bookingId required"));
         if (req.getPhoneNumber() == null || req.getPhoneNumber().isBlank()) {
             return ResponseEntity.badRequest().body(Map.of("error", "phoneNumber required"));
         }
 
-        Booking booking = bookingRepository.findById(req.getBookingId())
-                .orElseThrow(() -> new RuntimeException("Booking not found"));
+        Booking booking = bookingRepository.findById(req.getBookingId()).orElse(null);
+        if (booking == null) {
+            return ResponseEntity.status(404).body(Map.of("error", "Booking not found", "bookingId", req.getBookingId()));
+        }
 
-        // If already paid, return immediately
+        // If already paid, return final state.
         if (booking.getPaymentStatus() == Booking.PaymentStatus.PAID) {
             return ResponseEntity.ok(Map.of(
                     "status", "PAID",
@@ -79,77 +60,89 @@ public class PaymentsController {
             ));
         }
 
-        // Daraja expects whole number amounts
-        int amount = (int) Math.round(booking.getTicketType().getPrice());
-        if (amount <= 0) amount = 1;
+        // Allow retry: move FAILED/CANCELLED back to PENDING
+        bookingService.ensurePending(booking.getId());
 
+        Event event = booking.getEvent();
         String phone254 = normalizePhone(req.getPhoneNumber());
+        int amount = (int) Math.round(booking.getTicketType().getPrice());
+
+        // Shortcode (Paybill shortcode OR Till number)
+        String businessShortcode = event.getPaymentNumber();
+
+        // Transaction type & partyB:
+        // - PAYBILL: CustomerPayBillOnline
+        // - TILL: CustomerBuyGoodsOnline
+        String txType = (event.getPaymentMethod() == Event.PaymentMethod.TILL)
+                ? "CustomerBuyGoodsOnline"
+                : "CustomerPayBillOnline";
+
+        // Allow override via Render env vars (optional)
+        String txTypeOverride = System.getenv("DARAJA_TRANSACTION_TYPE");
+        if (txTypeOverride != null && !txTypeOverride.isBlank()) txType = txTypeOverride.trim();
+
+        String partyB = businessShortcode;
+        String partyBOverride = System.getenv("DARAJA_PARTYB");
+        if (partyBOverride != null && !partyBOverride.isBlank()) partyB = partyBOverride.trim();
+
         String accountRef = "BOOK-" + booking.getId();
-        String desc = "Nganya Experience - " + booking.getEvent().getTitle();
+        String desc = "Nganya Experience - " + event.getTitle();
 
-        // IMPORTANT:
-        // Do NOT use booking.getEvent().getPaymentNumber() for sandbox.
-        // Sandbox ONLY works with 174379.
-        // For production till we switch env vars (shortcode/partyB/type).
-        String businessShortcode = darajaShortcode;
-
-        // Token + STK push
         String token = darajaService.getAccessToken();
+
         Map<String, Object> resp = darajaService.stkPush(
                 token,
                 phone254,
                 amount,
                 businessShortcode,
                 partyB,
-                transactionType,
+                txType,
                 accountRef,
                 desc
         );
 
-        // Daraja may return errors without CheckoutRequestID, so be defensive
+        // Daraja may return errors without CheckoutRequestID; be defensive.
         String checkoutRequestId = resp.get("CheckoutRequestID") == null ? null : String.valueOf(resp.get("CheckoutRequestID"));
         String merchantRequestId = resp.get("MerchantRequestID") == null ? null : String.valueOf(resp.get("MerchantRequestID"));
 
-        // Save payment row
-        MpesaPayment payment = MpesaPayment.builder()
-                .booking(booking)
-                .phone(phone254)
-                .amount((double) amount)
-                .checkoutRequestId(checkoutRequestId)
-                .merchantRequestId(merchantRequestId)
-                .status(MpesaPayment.Status.PENDING)
-                .build();
+        if (checkoutRequestId == null || checkoutRequestId.isBlank()) {
+            return ResponseEntity.status(502).body(Map.of(
+                    "status", "ERROR",
+                    "message", "Daraja did not return CheckoutRequestID",
+                    "daraja", resp
+            ));
+        }
 
-        // Save raw response for debugging (in case callback never hits)
-        try {
-            payment.setRawCallback(objectMapper.writeValueAsString(Map.of("stkPushResponse", resp)));
-        } catch (Exception ignored) {}
-
+        // Save payment row (one-to-one per booking). If a payment exists already, overwrite it.
+        MpesaPayment payment = paymentRepository.findByBooking_Id(booking.getId()).orElse(
+                MpesaPayment.builder().booking(booking).build()
+        );
+        payment.setPhone(phone254);
+        payment.setAmount((double) amount);
+        payment.setCheckoutRequestId(checkoutRequestId);
+        payment.setMerchantRequestId(merchantRequestId);
+        payment.setStatus(MpesaPayment.Status.PENDING);
         paymentRepository.save(payment);
 
         return ResponseEntity.ok(Map.of(
                 "status", "PENDING",
-                "env", darajaEnv,
                 "checkoutRequestId", checkoutRequestId,
                 "merchantRequestId", merchantRequestId,
                 "bookingId", booking.getId(),
-                "amount", amount,
-                "phone", phone254,
                 "daraja", resp
         ));
     }
 
-    /**
-     * GET /api/payments/status/{checkoutRequestId}
-     * Frontend polls this to know if payment succeeded.
-     */
     @GetMapping("/status/{checkoutRequestId}")
     public ResponseEntity<?> status(@PathVariable String checkoutRequestId) {
         MpesaPayment payment = paymentRepository.findByCheckoutRequestId(checkoutRequestId)
-                .orElseThrow(() -> new RuntimeException("Payment not found"));
+                .orElse(null);
+
+        if (payment == null) {
+            return ResponseEntity.status(404).body(Map.of("error", "Payment not found", "checkoutRequestId", checkoutRequestId));
+        }
 
         Booking booking = payment.getBooking();
-
         return ResponseEntity.ok(Map.of(
                 "paymentStatus", payment.getStatus(),
                 "bookingPaymentStatus", booking.getPaymentStatus(),
@@ -159,18 +152,14 @@ public class PaymentsController {
     }
 
     /**
-     * POST /api/payments/callback
-     * Safaricom calls this after user enters PIN or cancels.
+     * Safaricom calls this URL after STK push.
      */
     @PostMapping("/callback")
     @Transactional
     public ResponseEntity<?> callback(@RequestBody Map<String, Object> payload) throws Exception {
-        // Expected:
-        // { Body: { stkCallback: { MerchantRequestID, CheckoutRequestID, ResultCode, ResultDesc, CallbackMetadata }}}
-
+        // Safaricom sends: { Body: { stkCallback: { MerchantRequestID, CheckoutRequestID, ResultCode, ResultDesc, CallbackMetadata }} }
         Map body = (Map) payload.get("Body");
         if (body == null) return ResponseEntity.ok(Map.of("ok", true));
-
         Map stk = (Map) body.get("stkCallback");
         if (stk == null) return ResponseEntity.ok(Map.of("ok", true));
 
@@ -179,15 +168,13 @@ public class PaymentsController {
 
         MpesaPayment payment = paymentRepository.findByCheckoutRequestId(checkoutRequestId).orElse(null);
         if (payment == null) {
-            // Unknown checkout id - still return 200 to stop retries
+            // Unknown checkout id - still return 200
             return ResponseEntity.ok(Map.of("ok", true));
         }
 
-        // Save raw callback JSON
         payment.setRawCallback(objectMapper.writeValueAsString(payload));
 
         if (resultCode != null && resultCode == 0) {
-            // SUCCESS
             String receipt = extractReceipt(stk);
             payment.setMpesaReceipt(receipt);
             payment.setStatus(MpesaPayment.Status.PAID);
@@ -196,31 +183,26 @@ public class PaymentsController {
             // Confirm booking, issue ticket, reduce seat
             bookingService.confirmPaid(payment.getBooking().getId());
         } else {
-            // FAILED or CANCELLED
             payment.setStatus(MpesaPayment.Status.FAILED);
             paymentRepository.save(payment);
+
+            // Mark booking failed (user can retry)
+            bookingService.markFailed(payment.getBooking().getId());
         }
 
         return ResponseEntity.ok(Map.of("ok", true));
     }
 
-    // ===== Helpers =====
-
     private static String normalizePhone(String phone) {
-        String p = phone.trim().replace(" ", "");
+        String p = phone == null ? "" : phone.trim();
+        // Accept 07.., 7.., +2547.., 2547..
         if (p.startsWith("+")) p = p.substring(1);
-
-        // 07XXXXXXXX -> 2547XXXXXXXX
         if (p.startsWith("0") && p.length() == 10) {
             return "254" + p.substring(1);
         }
-
-        // 7XXXXXXXX -> 2547XXXXXXXX
         if (p.startsWith("7") && p.length() == 9) {
             return "254" + p;
         }
-
-        // already 2547...
         return p;
     }
 
@@ -228,10 +210,8 @@ public class PaymentsController {
         try {
             Map meta = (Map) stk.get("CallbackMetadata");
             if (meta == null) return null;
-
             Object itemsObj = meta.get("Item");
             if (!(itemsObj instanceof java.util.List<?> items)) return null;
-
             for (Object it : items) {
                 if (!(it instanceof Map m)) continue;
                 if ("MpesaReceiptNumber".equals(String.valueOf(m.get("Name")))) {
